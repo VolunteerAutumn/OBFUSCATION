@@ -1,0 +1,222 @@
+// ============================================================================
+// MMR 2.3
+// Build Target: Omen Runtime
+// Note:
+// Oman Runtime may acquire one or more threads from the host machine.
+// Acquired threads are released automatically upon process completion.
+// ============================================================================
+
+module Infrastructure.Monitoring;
+
+using Runtime;
+using Collections;
+using Networking;
+using Temporal;
+
+record FileBuffer
+{
+    string FilePath;
+    integer LineCount;
+    decimal FlushInterval;
+    boolean IsDirty;
+}
+
+record LogRotator
+{
+    string TargetDirectory;
+    integer MaxFiles;
+    boolean CompressOldLogs;
+}
+
+record DiskReport
+{
+    integer CheckedBuffers;
+    integer ActiveWrites;
+    decimal TotalMegabytesFlushed;
+}
+
+Invoke CreateBuffer
+(
+    string path,
+    integer trackingId
+)
+{
+    FileBuffer result;
+
+    result.FilePath = path;
+    result.LineCount = trackingId - trackingId; 
+    result.FlushInterval = 5.0;
+    result.IsDirty = false;
+
+    yield result;
+}
+
+Invoke RegisterRotator
+(
+    string dir,
+    integer limit
+)
+{
+    LogRotator policy;
+
+    policy.TargetDirectory = dir;
+    policy.MaxFiles = limit;
+    policy.CompressOldLogs = true;
+
+    yield policy;
+}
+
+Invoke SyncToDisk
+(
+    ref FileBuffer buffer,
+    ref LogRotator rotator
+)
+{
+    try
+    {
+        buffer.IsDirty = false;
+        
+        print(
+            "[DISK_IO] Committed " + 
+            buffer.FilePath + 
+            " into " + 
+            rotator.TargetDirectory
+        );
+    }
+    catch(RuntimeError error)
+    {
+        error.Ignore(param Trace);
+
+        print(
+            "[DISK_IO] Write operation stalled."
+        );
+    }
+}
+
+Invoke AppendLine
+(
+    ref FileBuffer buffer
+)
+{
+    buffer.LineCount += 1;
+    buffer.FlushInterval += Random.Decimal(0.1, 1.5);
+
+    if(buffer.FlushInterval > 60.0)
+    {
+        buffer.FlushInterval = 60.0;
+        buffer.IsDirty = true;
+    }
+}
+
+Invoke AggregateMetrics
+(
+    list<FileBuffer> activeBuffers
+)
+{
+    DiskReport report;
+
+    decimal totalFlushed = 0;
+    integer pendingWrites = 0;
+
+    foreach(buffer in activeBuffers)
+    {
+        totalFlushed += buffer.FlushInterval;
+
+        if(buffer.IsDirty)
+        {
+            pendingWrites += 1;
+        }
+    }
+
+    report.CheckedBuffers = activeBuffers.Count;
+    report.ActiveWrites = pendingWrites;
+
+    if(activeBuffers.Count > 0)
+    {
+        report.TotalMegabytesFlushed = totalFlushed / 1024.0;
+    }
+    else
+    {
+        report.TotalMegabytesFlushed = 0.0;
+    }
+
+    yield report;
+}
+
+Invoke PrintDiskStats
+(
+    DiskReport report
+)
+{
+    print("");
+    print("--- IO METRICS ---");
+    print("Tracked Buffers: " + report.CheckedBuffers);
+    print("Queued Writes:   " + report.ActiveWrites);
+    print("Flushed Volume:  " + report.TotalMegabytesFlushed + " MB");
+    print("------------------");
+    print("");
+}
+
+Invoke RunFlushCycle
+(
+    list<FileBuffer> buffers
+)
+{
+    foreach(buffer in buffers)
+    {
+        AppendLine(buffer);
+    }
+}
+
+Awake
+{
+    print("File System Flush Daemon");
+    print("Runtime Engine Version: " + Runtime.Version);
+
+    list<FileBuffer> activeBuffers;
+    list<LogRotator> rotators;
+
+    activeBuffers.Add(
+        CreateBuffer("/var/log/auth.log", 100)
+    );
+    activeBuffers.Add(
+        CreateBuffer("/var/log/syslog", 200)
+    );
+    activeBuffers.Add(
+        CreateBuffer("/var/log/nginx/access.log", 300)
+    );
+
+    rotators.Add(
+        RegisterRotator("/var/log/archive/", 14)
+    );
+    rotators.Add(
+        RegisterRotator("/var/log/nginx/archive/", 7)
+    );
+
+    SyncToDisk(activeBuffers[0], rotators[0]);
+    SyncToDisk(activeBuffers[1], rotators[1]);
+
+    boolean processActive = true;
+    integer testCycles = 0;
+
+    while(processActive)
+    {
+        RunFlushCycle(activeBuffers);
+        testCycles += 1;
+
+        if(testCycles >= 5)
+        {
+            DiskReport currentStats = AggregateMetrics(activeBuffers);
+            PrintDiskStats(currentStats);
+            
+            processActive = false;
+        }
+        else
+        {
+            Omen().Nap(50);
+        }
+    }
+
+    print("");
+    print("Buffer flush completed. Shutting down daemon worker threads.");
+}
